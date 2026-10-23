@@ -1,0 +1,193 @@
+# ==============================================================================
+# GitHub Actions CI/CD Pipeline: Automated Image Build and Deployment
+# ==============================================================================
+# Pipeline Architecture:
+#
+#   [Git Push to 'main']
+#            │
+#            ▼
+#   ┌─────────────────────────────────────────────────────────────┐
+#   │ Job 1: build-and-push                                       │
+#   │  1. Check out code at specific commit                       │
+#   │  2. Authenticate with GitHub Container Registry (GHCR)      │
+#   │  3. Set up Docker Buildx with GitHub Actions layer caching  │
+#   │  4. Build & Tag image with Git commit SHA (NEVER "latest")  │
+#   │  5. Push immutable container image to GHCR                  │
+#   └─────────────────────────────────────────────────────────────┘
+#            │ (Job dependency: needs build-and-push)
+#            ▼
+#   ┌─────────────────────────────────────────────────────────────┐
+#   │ Job 2: deploy                                               │
+#   │  1. Spin up ephemeral Kubernetes cluster inside CI (kind)   │
+#   │  2. Pull & load SHA-tagged image into kind cluster          │
+#   │  3. Substitute exact commit SHA into deployment manifest    │
+#   │  4. Apply Kubernetes Service & Deployment manifests         │
+#   │  5. Wait for rollout (kubectl rollout status --timeout=60s) │
+#   │     --> If readiness fails: pipeline fails, job terminates! │
+#   │  6. Execute live smoke test via curl                        │
+#   │  7. Print pod status, describe events, & logs on failure    │
+#   └─────────────────────────────────────────────────────────────┘
+# ==============================================================================
+
+name: Automated Build & Deploy Pipeline
+
+# Trigger this pipeline automatically whenever changes are pushed to branch 'main'
+on:
+  push:
+    branches:
+      - main
+
+# Security permissions: Grant write permissions to publish container packages to GHCR
+permissions:
+  contents: read     # Read git repository contents
+  packages: write    # Publish and write Docker images to ghcr.io
+
+jobs:
+  # ============================================================================
+  # Job 1: Build and Push Container Image
+  # ============================================================================
+  build-and-push:
+    name: Build & Push to GHCR
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1.1: Fetch repository source code
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # Step 1.2: Authenticate with GitHub Container Registry (GHCR)
+      # Uses the short-lived GITHUB_TOKEN automatically provided by GitHub Actions
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Step 1.3: Convert repository name to lowercase and generate SHA-based tag
+      # GHCR requires repository and image names to be lowercase.
+      # We strictly use the Git commit SHA for tagging; NEVER the mutable "latest" tag.
+      - name: Generate Image Tag Metadata
+        id: meta
+        run: |
+          REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE_TAG="ghcr.io/${REPO_LOWER}:${{ github.sha }}"
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "Target Image Tag: ${IMAGE_TAG}"
+
+      # Step 1.4: Set up Docker Buildx for advanced caching and multi-layer builds
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Step 1.5: Build container image and push to GHCR
+      # GitHub Actions cache (type=gha) caches dependencies between workflow runs
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.image_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ============================================================================
+  # Job 2: Deploy to Kubernetes Cluster (kind) & Smoke Test
+  # ============================================================================
+  deploy:
+    name: Deploy to Kubernetes & Verify
+    needs: build-and-push   # Guarantees deployment only runs after successful build & push
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 2.1: Fetch repository source code (for Kubernetes manifests)
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # Step 2.2: Determine exact image tag using the same commit SHA
+      - name: Compute Image Tag
+        id: meta
+        run: |
+          REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE_TAG="ghcr.io/${REPO_LOWER}:${{ github.sha }}"
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "Deploying Image: ${IMAGE_TAG}"
+
+      # Step 2.3: Provision a local Kubernetes cluster inside CI using kind (Kubernetes-in-Docker)
+      - name: Create kind Cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: ci-cluster
+          wait: 120s
+
+      # Step 2.4: Authenticate with GHCR so runner can pull the newly published image
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      # Step 2.5: Pull SHA-tagged image and preload into kind cluster nodes
+      # Loading directly into kind avoids image pull secret issues and accelerates pod startup
+      - name: Pull and Load Image into kind
+        run: |
+          echo "Pulling image from GHCR..."
+          docker pull ${{ steps.meta.outputs.image_tag }}
+          echo "Loading image into kind cluster..."
+          kind load docker-image ${{ steps.meta.outputs.image_tag }} --name ci-cluster
+
+      # Step 2.6: Substitute image placeholder in k8s/deployment.yaml with exact commit SHA
+      - name: Set Exact Commit SHA in Deployment Manifest
+        run: |
+          echo "Replacing IMAGE_TAG_PLACEHOLDER with ${{ steps.meta.outputs.image_tag }}"
+          sed -i "s|IMAGE_TAG_PLACEHOLDER|${{ steps.meta.outputs.image_tag }}|g" k8s/deployment.yaml
+          echo "--- Resulting k8s/deployment.yaml ---"
+          cat k8s/deployment.yaml
+
+      # Step 2.7: Apply Kubernetes manifests
+      - name: Apply Kubernetes Manifests
+        run: |
+          kubectl apply -f k8s/service.yaml
+          kubectl apply -f k8s/deployment.yaml
+
+      # Step 2.8: Wait for Kubernetes Rolling Update to succeed
+      # The 60-second timeout acts as our automated quality gate.
+      # If new pods fail the readiness probe, this command exits with code 1 and fails the job!
+      - name: Wait for Rollout Completion
+        run: |
+          echo "Waiting for pods to pass readinessProbe..."
+          kubectl rollout status deployment/app-deployment --timeout=60s
+
+      # Step 2.9: Execute smoke test against the live running service
+      - name: Run Smoke Test
+        run: |
+          echo "Forwarding service port 80 to localhost:8080..."
+          kubectl port-forward svc/app-service 8080:80 &
+          PF_PID=$!
+          sleep 4
+
+          echo "Querying root endpoint /..."
+          ROOT_RESPONSE=$(curl --silent --show-error --fail http://localhost:8080/)
+          echo "Root response: $ROOT_RESPONSE"
+
+          echo "Querying health check endpoint /health..."
+          HEALTH_RESPONSE=$(curl --silent --show-error --fail http://localhost:8080/health)
+          echo "Health response: $HEALTH_RESPONSE"
+
+          # Clean up background port-forward process
+          kill $PF_PID
+
+      # Step 2.10: Automated Diagnostics (Runs only if any previous step fails)
+      # Dumps detailed cluster events and pod logs to help pinpoint the root cause quickly
+      - name: Dump Diagnostic Logs on Failure
+        if: failure()
+        run: |
+          echo "=================================================================="
+          echo "                     DEPLOYMENT FAILURE DIAGNOSTICS               "
+          echo "=================================================================="
+          echo "--- Deployment Status ---"
+          kubectl get deployments -o wide
+          echo "--- Pod Status ---"
+          kubectl get pods -o wide
+          echo "--- Pod Events & Description ---"
+          kubectl describe pods -l app=demo-app
+          echo "--- Container Logs ---"
+          kubectl logs -l app=demo-app --all-containers=true --tail=100

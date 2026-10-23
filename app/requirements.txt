@@ -1,0 +1,8 @@
+# ==============================================================================
+# Python Application Dependencies
+# ==============================================================================
+# Flask: Lightweight web framework for Python
+Flask==3.1.0
+
+# Gunicorn: Production-ready WSGI HTTP server to serve the Flask app
+gunicorn==23.0.0
